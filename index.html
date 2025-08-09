@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1, maximum-scale=1"/>
+<title>Fried Eagle Eat — Mini</title>
+<style>
+  html,body{margin:0;padding:0;background:#0e0e12;color:#fff;font-family:system-ui,Segoe UI,Roboto,Arial}
+  #ui{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #startBtn, .btn {background:#ff7a00;border:none;color:#111;padding:14px 22px;border-radius:12px;
+    font-weight:800;letter-spacing:.3px;font-size:18px;box-shadow:0 6px 18px rgba(255,122,0,.3)}
+  #startBtn:active,.btn:active{transform:translateY(1px)}
+  #hud{position:fixed;left:10px;top:10px;right:10px;display:flex;gap:8px;align-items:center;justify-content:space-between;pointer-events:none}
+  #hud .pill{background:rgba(255,255,255,.08);padding:8px 12px;border-radius:999px;font-weight:700}
+  #stage{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(255,255,255,.08);
+    padding:8px 14px;border-radius:999px;font-weight:700}
+  canvas{display:block; width:100vw; height:100vh; touch-action:none}
+  #tip{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);opacity:.9;font-size:14px;background:rgba(0,0,0,.5);
+    padding:6px 10px;border-radius:10px}
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+
+<div id="hud" style="display:none">
+  <div class="pill" id="score">Score: 0</div>
+  <div class="pill" id="stars">⭐️ Stars: 0</div>
+  <div class="pill" id="orders">Orders: 0/5</div>
+</div>
+<div id="stage" style="display:none"></div>
+<div id="tip" style="display:none"></div>
+
+<div id="ui"><button id="startBtn">Tap to Start • FEE</button></div>
+
+<script>
+(()=>{
+// ====== Utilities ======
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+function fitCanvas(){
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = Math.floor(w*dpr);
+  canvas.height = Math.floor(h*dpr);
+  canvas.style.width = w+'px'; canvas.style.height = h+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', fitCanvas); fitCanvas();
+
+const hud = { scoreEl:document.getElementById('score'), starsEl:document.getElementById('stars'),
+  ordersEl:document.getElementById('orders'), stageEl:document.getElementById('stage'), tipEl:document.getElementById('tip') };
+
+let audio, masterGain;
+function initAudio(){
+  audio = new (window.AudioContext||window.webkitAudioContext)();
+  masterGain = audio.createGain(); masterGain.gain.value = 0.15; masterGain.connect(audio.destination);
+}
+function beep({freq=440, dur=0.08, type='square', slide=0}={}){
+  if(!audio) return;
+  const o = audio.createOscillator(); const g = audio.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, audio.currentTime);
+  if(slide){ o.frequency.linearRampToValueAtTime(freq+slide, audio.currentTime+dur); }
+  g.gain.value = 0.001;
+  g.gain.exponentialRampToValueAtTime(0.6, audio.currentTime+0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime+dur);
+  o.connect(g); g.connect(masterGain);
+  o.start(); o.stop(audio.currentTime+dur);
+}
+function whoosh(){ beep({freq:200, dur:.12, type:'sawtooth', slide: -120}) }
+function pop(){ beep({freq:750, dur:.05, type:'triangle'}) }
+function sizzle(){ // short noise burst
+  if(!audio) return;
+  const buffer = audio.createBuffer(1, audio.sampleRate*0.25, audio.sampleRate);
+  const data = buffer.getChannelData(0);
+  for(let i=0;i<data.length;i++){ data[i] = (Math.random()*2-1)*Math.pow(1-i/data.length,2); }
+  const src = audio.createBufferSource(); src.buffer = buffer;
+  const g = audio.createGain(); g.gain.value = .2; g.connect(masterGain);
+  src.connect(g); src.start();
+}
+
+// ====== Game State ======
+const STAGES = ["HUNT","PLUCK","CUT","FRY","BAG","SERVE"];
+let state = {
+  stageIndex:0, score:0, stars:0, ordersDone:0, targetOrders:5, time:0,
+  eagles:[], feathers:[], cuts:[], oilTemp:160, fryTimer:0, cooked:0, bagItems:0,
+  order:{sauce:false,koukie:false}, customersQueue:[], tutorialShown:false
+};
+
+function setStage(name){
+  state.stageIndex = STAGES.indexOf(name);
+  hud.stageEl.style.display='block';
+  hud.stageEl.textContent = `Stage: ${name}`;
+  switch(name){
+    case "HUNT": tip("Tap eagles to shoot!"); spawnEagles(); break;
+    case "PLUCK": tip("Swipe over feathers to pluck!"); spawnFeathers(); break;
+    case "CUT": tip("Swipe to slice meat into strips!"); state.cuts=[]; break;
+    case "FRY": tip("Press & hold to fry. Keep temp ~180–190!"); state.fryTimer=0; break;
+    case "BAG": tip("Hold to add pieces into the bag!"); state.bagItems=0; break;
+    case "SERVE": makeOrder(); tip("Toggle add-ons, then Serve!"); break;
+  }
+}
+function tip(t){ hud.tipEl.style.display='block'; hud.tipEl.textContent=t; setTimeout(()=>{hud.tipEl.style.display='none'}, 3500); }
+function nextStage(){ setStage(STAGES[(state.stageIndex+1)%STAGES.length]) }
+
+// ====== Entities ======
+function spawnEagles(){
+  state.eagles = [];
+  const rows = 3 + Math.floor(Math.random()*2);
+  for(let r=0;r<rows;r++){
+    for(let i=0;i<3;i++){
+      state.eagles.push({
+        x: -80 - Math.random()*200, y: 80 + r*80 + Math.random()*40,
+        v: 2.2 + Math.random()*1.4, alive:true, rare: Math.random()<0.15
+      });
+    }
+  }
+}
+function spawnFeathers(){
+  state.feathers = [];
+  for(let i=0;i<20;i++){
+    state.feathers.push({x: 60+Math.random()*(canvas.width/2-120), y: 120+Math.random()*(canvas.height-240), r: 10+Math.random()*10});
+  }
+}
+function makeOrder(){
+  state.order = { sauce: Math.random()<0.5, koukie: Math.random()<0.5 };
+}
+function addCustomer(){
+  state.customersQueue.push({ patience: 1.0 });
+}
+
+// ====== Input ======
+let pointer = {x:0,y:0,down:false, justTapped:false};
+function posFromEvent(e){
+  const t = e.touches? e.touches[0] : e;
+  return { x: t.clientX, y: t.clientY };
+}
+canvas.addEventListener('pointerdown', e=>{ pointer.down=true; pointer.justTapped=true; const p=posFromEvent(e); pointer.x=p.x; pointer.y=p.y; });
+canvas.addEventListener('pointermove', e=>{ const p=posFromEvent(e); pointer.x=p.x; pointer.y=p.y; });
+canvas.addEventListener('pointerup', e=>{ pointer.down=false; });
+
+// ====== Logic ======
+function update(dt){
+  state.time += dt;
+  // HUD
+  hud.scoreEl.textContent = `Score: ${state.score}`;
+  hud.starsEl.textContent = `⭐️ Stars: ${state.stars}`;
+  hud.ordersEl.textContent = `Orders: ${state.ordersDone}/${state.targetOrders}`;
+
+  const stage = STAGES[state.stageIndex];
+
+  if(stage==="HUNT"){
+    for(const eg of state.eagles){
+      if(!eg.alive) continue;
+      eg.x += eg.v* (1+0.05*Math.sin(state.time*2));
+      if(eg.x > canvas.width+60){ eg.x = -80; eg.y = 80 + Math.random()*(canvas.height-200); }
+    }
+    if(pointer.justTapped){
+      let hit = false;
+      for(const eg of state.eagles){
+        const dx = pointer.x-eg.x, dy = pointer.y-eg.y;
+        if(eg.alive && Math.hypot(dx,dy)<28){
+          eg.alive=false; hit=true;
+          state.score += eg.rare? 50: 20;
+          state.stars += eg.rare? 2: 1;
+          whoosh(); pop();
+        }
+      }
+      if(!hit) beep({freq:220,dur:.05,type:'square'});
+      // all down?
+      if(state.eagles.every(e=>!e.alive)){ nextStage(); }
+    }
+  }
+  else if(stage==="PLUCK"){
+    if(pointer.down){
+      for(const f of state.feathers){
+        if(!f.rem && Math.hypot(pointer.x-f.x, pointer.y-f.y) < f.r+4){
+          f.rem=true; pop(); state.score += 2;
+        }
+      }
+      if(state.feathers.every(f=>f.rem)){ nextStage(); }
+    }
+  }
+  else if(stage==="CUT"){
+    if(pointer.down){
+      const last = state.cuts[state.cuts.length-1];
+      if(!last || Math.hypot(pointer.x-last.x, pointer.y-last.y) > 16){
+        state.cuts.push({x:pointer.x,y:pointer.y});
+        beep({freq:500+Math.random()*100, dur:.03, type:'triangle'});
+      }
+      if(state.cuts.length>25){ nextStage(); state.score+=30; state.stars+=1; }
+    }
+  }
+  else if(stage==="FRY"){
+    const target = 185;
+    state.oilTemp += (target - state.oilTemp)*0.01;
+    if(pointer.down){ state.oilTemp += 0.25; state.fryTimer += dt; if(Math.random()<0.2) sizzle(); }
+    else { state.oilTemp -= 0.18; }
+    const sweet = 180, diff = Math.abs(state.oilTemp - sweet);
+    if(pointer.down && diff<15) state.cooked += dt*1.2;
+    if(state.cooked>=2.5){
+      state.cooked=2.5; nextStage(); state.score+=50; state.stars+=2; pop();
+    }
+  }
+  else if(stage==="BAG"){
+    if(pointer.down){
+      state.bagItems += 0.02;
+      if(state.bagItems>=1){ nextStage(); pop(); }
+    }
+  }
+  else if(stage==="SERVE"){
+    if(state.customersQueue.length===0) addCustomer();
+    for(const c of state.customersQueue){ c.patience = Math.max(0, c.patience - dt*0.02); }
+    if(state.customersQueue[0].patience===0){
+      state.customersQueue.shift(); beep({freq:140, dur:.25, type:'sawtooth', slide:-60});
+    }
+  }
+
+  pointer.justTapped=false;
+}
+
+// ====== Render ======
+function draw(){
+  const w = canvas.width/ (window.devicePixelRatio||1);
+  const h = canvas.height/ (window.devicePixelRatio||1);
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,'#141824'); g.addColorStop(1,'#0d1117');
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+
+  const stage = STAGES[state.stageIndex];
+
+  if(stage==="HUNT"){
+    ctx.fillStyle='#1e2a38'; ctx.fillRect(0,h-120,w,120);
+    ctx.fillStyle='#223448'; for(let i=0;i<12;i++){ ctx.fillRect(i*120+((state.time*20)%120), h-140, 60, 26); }
+    for(const eg of state.eagles){
+      if(!eg.alive) continue;
+      ctx.save(); ctx.translate(eg.x, eg.y);
+      ctx.fillStyle = eg.rare ? '#d4af37' : '#6b4a2e';
+      ctx.beginPath(); ctx.ellipse(0,0,26,18,0,0,Math.PI*2); ctx.fill();
+      ctx.rotate(Math.sin(state.time*8+eg.x)*0.2);
+      ctx.fillStyle = eg.rare ? '#b98d1f' : '#4f3623';
+      ctx.fillRect(-10,-22,20,14);
+      ctx.rotate(-Math.sin(state.time*8+eg.x)*0.2);
+      ctx.fillStyle='#ffbf47'; ctx.fillRect(20,-4,10,8);
+      ctx.restore();
+    }
+  }
+  else{
+    ctx.fillStyle='#13161e'; ctx.fillRect(0,h-200,w,200);
+    ctx.fillStyle='#19202b'; ctx.fillRect(0,h-220,w,20);
+  }
+
+  if(stage==="PLUCK"){
+    ctx.fillStyle='#5a3d28'; ctx.beginPath(); ctx.ellipse(w*0.33,h*0.55,80,50,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#c8c2b8';
+    for(const f of state.feathers){ if(!f.rem){ ctx.beginPath(); ctx.arc(f.x,f.y,f.r,0,Math.PI*2); ctx.fill(); } }
+  }
+
+  if(stage==="CUT"){
+    ctx.fillStyle='#8a5740'; ctx.fillRect(40, h-180, w-80, 120);
+    ctx.fillStyle='#5a3d28'; ctx.fillRect(80, h-230, w-160, 40);
+    ctx.fillStyle='#b65b3c'; ctx.fillRect(w*0.2, h*0.45, w*0.6, 120);
+    ctx.strokeStyle='rgba(255,255,255,.7)'; ctx.lineWidth=2;
+    ctx.beginPath();
+    for(const c of state.cuts){ ctx.lineTo(c.x,c.y); }
+    ctx.stroke();
+  }
+
+  if(stage==="FRY"){
+    ctx.fillStyle='#0a0f14'; ctx.fillRect(w*0.2, h*0.35, w*0.6, 220);
+    const oilTop = h*0.35+40;
+    ctx.fillStyle='#a36c00'; ctx.globalAlpha=0.9; ctx.fillRect(w*0.22, oilTop, w*0.56, 180); ctx.globalAlpha=1;
+    ctx.fillStyle='#fff'; ctx.fillRect(20,20,14,180);
+    ctx.fillStyle='#ff7a00'; const tH = Math.max(0, Math.min(180, (state.oilTemp-120))); ctx.fillRect(20, 200 - tH, 14, tH);
+    ctx.fillStyle='#bbb'; ctx.fillText(`Oil: ${Math.round(state.oilTemp)}°C`, 40, 28);
+    ctx.fillText(`Cook: ${Math.round(state.cooked*40)}%`, 40, 48);
+  }
+
+  if(stage==="BAG"){
+    ctx.fillStyle='#2a3240'; ctx.fillRect(w*0.15, h*0.5, w*0.7, 16);
+    ctx.fillStyle='#ff7a00'; ctx.fillRect(w*0.7, h*0.36, 120, 140);
+    ctx.fillStyle='#111'; ctx.fillText(`Bag: ${Math.round(state.bagItems*100)}%`, w*0.7, h*0.36-8);
+    const n = Math.floor(state.bagItems*8);
+    for(let i=0;i<n;i++){
+      ctx.fillStyle='#f6c167'; ctx.beginPath(); ctx.arc(w*0.3 + i*22, h*0.5-10, 10, 0, Math.PI*2); ctx.fill();
+    }
+  }
+
+  if(stage==="SERVE"){
+    const x = 16, y = 64;
+    ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fillRect(x,y,180,100);
+    ctx.fillStyle='#fff'; ctx.fillText('Order:', x+10, y+20);
+    ctx.fillText(`Sauce: ${state.order.sauce? 'Yes':'No'}`, x+10, y+40);
+    ctx.fillText(`Koukie: ${state.order.koukie? 'Yes':'No'}`, x+10, y+60);
+    const c = state.customersQueue[0];
+    if(c){
+      ctx.fillStyle='#6ee7ff'; ctx.beginPath(); ctx.arc(w-80, 90, 30, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle='#444'; ctx.fillRect(w-160,140,160,10);
+      ctx.fillStyle='#4aff7a'; ctx.fillRect(w-160,140,160*c.patience,10);
+    }
+    ctx.fillStyle='#222'; ctx.fillRect(w*0.35,h*0.55, w*0.3, 10);
+    ctx.fillStyle='#f6c167'; for(let i=0;i<6;i++){ ctx.fillRect(w*0.36+i*20, h*0.54, 14, 8); }
+    if(state.order.sauce){ ctx.fillStyle='#ff3131'; ctx.fillRect(w*0.36, h*0.51, 90, 6); }
+    if(state.order.koukie){ ctx.fillStyle='#c9a36b'; ctx.fillRect(w*0.36, h*0.49, 110, 4); }
+  }
+}
+
+// ====== Buttons ======
+function makeUIButton(text, onClick, rightOffset){
+  const b = document.createElement('button');
+  b.className='btn'; b.textContent=text;
+  b.style.position='fixed'; b.style.bottom='12px'; b.style.right= rightOffset+'px';
+  b.style.pointerEvents='auto';
+  b.addEventListener('click', onClick);
+  document.body.appendChild(b);
+  return b;
+}
+let sauceBtn, koukieBtn, serveBtn;
+function setupServeButtons(){
+  if(sauceBtn) return;
+  sauceBtn = makeUIButton('Toggle Sauce', ()=>{ state.order.sauce = !state.order.sauce; pop(); }, 216);
+  koukieBtn = makeUIButton('Toggle Koukie', ()=>{ state.order.koukie = !state.order.koukie; pop(); }, 110);
+  serveBtn  = makeUIButton('Serve ▶', ()=>{
+    state.ordersDone++; state.score += 120; state.stars += 2; state.customersQueue.shift(); pop();
+    if(state.ordersDone>=state.targetOrders){
+      alert('🎉 Shift Complete! You built a FEE mini-empire.\nPlay again to speed-run!');
+      state.ordersDone=0; state.score=0; state.stars=0;
+    }
+    setStage("HUNT");
+  }, 12);
+}
+function showHUD(show){
+  document.getElementById('hud').style.display = show?'flex':'none';
+  hud.stageEl.style.display = show?'block':'none';
+}
+
+// ====== Main Loop ======
+let last=0;
+function frame(t){
+  const dt = Math.min(0.033, (t-last)/1000||0); last=t;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ====== Start ======
+document.getElementById('startBtn').addEventListener('click', async ()=>{
+  document.getElementById('ui').style.display='none';
+  showHUD(true);
+  if(!audio) initAudio();
+  setStage("HUNT");
+  setupServeButtons();
+});
+
+})();</script>
+</body>
+</html>
